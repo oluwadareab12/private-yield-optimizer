@@ -1,6 +1,10 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+
+// ─── Config ───────────────────────────────────────────────────────────────────
+// Set to false to use the real Express backend at /api/*
+const MOCK_MODE = true;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -24,6 +28,23 @@ interface SettlementResult {
   algorithmHash: string;
 }
 
+// Shape stored in React state in mock mode — mirrors backend LPOffer / ProtocolOffer
+interface StoredLPOffer {
+  id: string;
+  encryptedCapital: string;
+  encryptedMinYield: string;
+  iv: string;
+  clientPublicKey: string;
+}
+
+interface StoredProtocolOffer {
+  id: string;
+  encryptedDemand: string;
+  encryptedMaxRate: string;
+  iv: string;
+  clientPublicKey: string;
+}
+
 // ─── Crypto helpers ───────────────────────────────────────────────────────────
 
 function toB64(bytes: Uint8Array): string {
@@ -35,10 +56,9 @@ function fromB64(s: string): Uint8Array {
 }
 
 /**
- * Encrypts each numeric field independently under a shared ECDH session.
- * Pattern: X25519 ECDH → HKDF-SHA256 (field-specific info) → AES-GCM-256.
- * All fields share one IV and one ephemeral key pair; different HKDF info
- * strings ensure distinct cipher keys, so reusing the IV is safe.
+ * Client-side encryption: X25519 ECDH → HKDF-SHA256 → AES-GCM-256.
+ * One ephemeral key pair and one IV per offer; each field gets a
+ * distinct AES key via a field-specific HKDF info string.
  */
 async function encryptOfferFields(
   fields: Record<string, number>,
@@ -68,7 +88,6 @@ async function encryptOfferFields(
 
   const ivBytes = crypto.getRandomValues(new Uint8Array(12));
   const iv = toB64(ivBytes);
-
   const clientPublicKey = toB64(
     new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey))
   );
@@ -98,6 +117,146 @@ async function encryptOfferFields(
   return { encrypted, iv, clientPublicKey };
 }
 
+/**
+ * MXE-side decryption (mirrors backend matchingEngine.ts).
+ * Used in mock mode to decrypt stored offers before running the auction.
+ */
+async function decryptField(
+  ciphertextB64: string,
+  ivB64: string,
+  mxePrivateKey: CryptoKey,
+  clientPublicKeyB64: string,
+  fieldInfo: string
+): Promise<number> {
+  const clientPub = await crypto.subtle.importKey(
+    "raw",
+    fromB64(clientPublicKeyB64),
+    { name: "X25519" } as AlgorithmIdentifier,
+    false,
+    []
+  );
+
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: "X25519", public: clientPub } as AlgorithmIdentifier,
+    mxePrivateKey,
+    256
+  );
+
+  const hkdf = await crypto.subtle.importKey("raw", sharedBits, "HKDF", false, ["deriveKey"]);
+
+  const aesKey = await crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: new Uint8Array(32),
+      info: new TextEncoder().encode(`yield-optimizer-v1:${fieldInfo}`),
+    },
+    hkdf,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+
+  const plaintext = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: fromB64(ivB64) },
+    aesKey,
+    fromB64(ciphertextB64)
+  );
+
+  return parseFloat(new TextDecoder().decode(plaintext));
+}
+
+/**
+ * In-browser sealed double auction — exact same logic as backend matchingEngine.ts.
+ * Decrypts all stored encrypted offers, runs greedy sort-and-match,
+ * and derives algorithmHash via crypto.subtle.digest.
+ */
+async function runMockAuction(
+  lpOffers: StoredLPOffer[],
+  protocolOffers: StoredProtocolOffer[],
+  mxePrivateKey: CryptoKey
+): Promise<Omit<SettlementResult, "settlementId">> {
+  const [decryptedLPs, decryptedProtocols] = await Promise.all([
+    Promise.all(
+      lpOffers.map(async (lp) => ({
+        id: lp.id,
+        capital: await decryptField(lp.encryptedCapital, lp.iv, mxePrivateKey, lp.clientPublicKey, "capital"),
+        minYield: await decryptField(lp.encryptedMinYield, lp.iv, mxePrivateKey, lp.clientPublicKey, "minYield"),
+      }))
+    ),
+    Promise.all(
+      protocolOffers.map(async (p) => ({
+        id: p.id,
+        demand: await decryptField(p.encryptedDemand, p.iv, mxePrivateKey, p.clientPublicKey, "demand"),
+        maxRate: await decryptField(p.encryptedMaxRate, p.iv, mxePrivateKey, p.clientPublicKey, "maxRate"),
+      }))
+    ),
+  ]);
+
+  // LPs ascending by yield floor; protocols descending by max rate
+  const sortedLPs = [...decryptedLPs].sort((a, b) => a.minYield - b.minYield);
+  const sortedProtocols = [...decryptedProtocols].sort((a, b) => b.maxRate - a.maxRate);
+
+  const matches: MatchResult[] = [];
+  const remainingDemand = new Map(sortedProtocols.map((p) => [p.id, p.demand]));
+
+  for (const lp of sortedLPs) {
+    let remainingCapital = lp.capital;
+    for (const protocol of sortedProtocols) {
+      if (remainingCapital <= 0) break;
+      if (lp.minYield > protocol.maxRate) continue;
+      const available = remainingDemand.get(protocol.id) ?? 0;
+      if (available <= 0) continue;
+      const allocated = Math.min(remainingCapital, available);
+      const clearingRate = (lp.minYield + protocol.maxRate) / 2;
+      matches.push({
+        lpId: lp.id,
+        protocolId: protocol.id,
+        clearingRate: Math.round(clearingRate * 1e8) / 1e8,
+        capitalAllocated: Math.round(allocated * 1e8) / 1e8,
+      });
+      remainingDemand.set(protocol.id, available - allocated);
+      remainingCapital -= allocated;
+    }
+  }
+
+  const totalCapitalMatched = matches.reduce((sum, m) => sum + m.capitalAllocated, 0);
+  const averageClearingRate =
+    totalCapitalMatched > 0
+      ? matches.reduce((sum, m) => sum + m.clearingRate * m.capitalAllocated, 0) / totalCapitalMatched
+      : 0;
+  const participantCount = new Set([
+    ...matches.map((m) => m.lpId),
+    ...matches.map((m) => m.protocolId),
+  ]).size;
+  const settledAt = new Date().toISOString();
+
+  const hashBuffer = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(
+      JSON.stringify({
+        algorithm: "sealed-double-auction-v1",
+        lpCount: lpOffers.length,
+        protocolCount: protocolOffers.length,
+        matchCount: matches.length,
+        settledAt,
+      })
+    )
+  );
+  const algorithmHash = Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  return {
+    matches,
+    totalCapitalMatched: Math.round(totalCapitalMatched * 1e8) / 1e8,
+    averageClearingRate: Math.round(averageClearingRate * 1e8) / 1e8,
+    participantCount,
+    settledAt,
+    algorithmHash,
+  };
+}
+
 // ─── Design tokens ────────────────────────────────────────────────────────────
 
 const card: React.CSSProperties = {
@@ -123,7 +282,10 @@ interface FieldProps extends React.InputHTMLAttributes<HTMLInputElement> {
 }
 
 function Field({ label, hint, accent = "cyan", ...rest }: FieldProps) {
-  const focusBorder = accent === "cyan" ? "focus:border-cyan-500/60 focus:ring-cyan-500/20" : "focus:border-purple-500/60 focus:ring-purple-500/20";
+  const focusBorder =
+    accent === "cyan"
+      ? "focus:border-cyan-500/60 focus:ring-cyan-500/20"
+      : "focus:border-purple-500/60 focus:ring-purple-500/20";
   return (
     <div className="flex flex-col gap-1.5">
       <label className={labelCls}>{label}</label>
@@ -136,8 +298,19 @@ function Field({ label, hint, accent = "cyan", ...rest }: FieldProps) {
   );
 }
 
-function IdField({ value, onChange, accent = "cyan" }: { value: string; onChange: (v: string) => void; accent?: "cyan" | "purple" }) {
-  const focusBorder = accent === "cyan" ? "focus:border-cyan-500/60 focus:ring-cyan-500/20" : "focus:border-purple-500/60 focus:ring-purple-500/20";
+function IdField({
+  value,
+  onChange,
+  accent = "cyan",
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  accent?: "cyan" | "purple";
+}) {
+  const focusBorder =
+    accent === "cyan"
+      ? "focus:border-cyan-500/60 focus:ring-cyan-500/20"
+      : "focus:border-purple-500/60 focus:ring-purple-500/20";
   return (
     <div className="flex flex-col gap-1.5">
       <label className={labelCls}>Participant ID</label>
@@ -147,7 +320,7 @@ function IdField({ value, onChange, accent = "cyan" }: { value: string; onChange
         className={`w-full bg-white/[0.04] border border-white/[0.12] rounded-xl px-4 py-3 text-slate-400 font-mono text-xs focus:outline-none focus:ring-1 transition-all duration-200 ${focusBorder}`}
         placeholder="Auto-generated UUID"
       />
-      <p className="text-[11px] text-slate-600">Save this ID — you'll need it to check your result</p>
+      <p className="text-[11px] text-slate-600">Save this ID — you&apos;ll need it to check your result</p>
     </div>
   );
 }
@@ -227,7 +400,7 @@ function SuccessCard({
       <div className="text-4xl mb-3">✅</div>
       <p className="text-emerald-400 font-semibold text-base mb-1">Offer submitted encrypted</p>
       <p className="text-slate-500 text-sm mb-5">
-        Your values are sealed inside the MXE — not visible to anyone
+        Your values are sealed — not visible to anyone until auction runs
       </p>
       <div
         className="rounded-lg px-4 py-2.5 text-xs font-mono break-all mb-1"
@@ -281,12 +454,39 @@ export default function Home() {
   } | null>(null);
   const [checkError, setCheckError] = useState("");
 
+  // Mock-mode state: encrypted offers stored in browser instead of the backend
+  const [storedLpOffers, setStoredLpOffers] = useState<StoredLPOffer[]>([]);
+  const [storedProtocolOffers, setStoredProtocolOffers] = useState<StoredProtocolOffer[]>([]);
+
+  // Simulated MXE key pair — generated once on mount, never leaves the browser
+  const mockMxeKeyRef = useRef<CryptoKeyPair | null>(null);
+
   useEffect(() => {
-    setLpId(crypto.randomUUID());
-    setProtocolId(crypto.randomUUID());
+    const init = async () => {
+      setLpId(crypto.randomUUID());
+      setProtocolId(crypto.randomUUID());
+
+      if (MOCK_MODE) {
+        const kp = (await crypto.subtle.generateKey(
+          { name: "X25519" } as AlgorithmIdentifier,
+          true,
+          ["deriveBits"]
+        )) as CryptoKeyPair;
+        mockMxeKeyRef.current = kp;
+      }
+    };
+    init();
   }, []);
 
+  // ── MXE public key resolution ──────────────────────────────────────────────
+
   const getMxePubkey = useCallback(async (): Promise<string> => {
+    if (MOCK_MODE) {
+      const kp = mockMxeKeyRef.current;
+      if (!kp) throw new Error("Mock MXE key not ready yet — try again in a moment");
+      const raw = await crypto.subtle.exportKey("raw", kp.publicKey);
+      return toB64(new Uint8Array(raw));
+    }
     const res = await fetch("/api/mxe-pubkey");
     if (!res.ok) throw new Error("MXE node unreachable — is the backend running?");
     const { publicKey } = await res.json();
@@ -305,21 +505,33 @@ export default function Home() {
         { capital: parseFloat(lpCapital), minYield: parseFloat(lpMinYield) },
         mxePub
       );
-      const res = await fetch("/api/offer/lp", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: lpId,
-          encryptedCapital: encrypted.capital,
-          encryptedMinYield: encrypted.minYield,
-          iv,
-          clientPublicKey,
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(JSON.stringify(err));
+
+      if (MOCK_MODE) {
+        setStoredLpOffers((prev) => [
+          ...prev,
+          {
+            id: lpId,
+            encryptedCapital: encrypted.capital,
+            encryptedMinYield: encrypted.minYield,
+            iv,
+            clientPublicKey,
+          },
+        ]);
+      } else {
+        const res = await fetch("/api/offer/lp", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: lpId,
+            encryptedCapital: encrypted.capital,
+            encryptedMinYield: encrypted.minYield,
+            iv,
+            clientPublicKey,
+          }),
+        });
+        if (!res.ok) throw new Error(JSON.stringify(await res.json()));
       }
+
       setLpStatus("success");
     } catch (err) {
       setLpStatus("error");
@@ -339,21 +551,33 @@ export default function Home() {
         { demand: parseFloat(protocolDemand), maxRate: parseFloat(protocolMaxRate) },
         mxePub
       );
-      const res = await fetch("/api/offer/protocol", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          id: protocolId,
-          encryptedDemand: encrypted.demand,
-          encryptedMaxRate: encrypted.maxRate,
-          iv,
-          clientPublicKey,
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(JSON.stringify(err));
+
+      if (MOCK_MODE) {
+        setStoredProtocolOffers((prev) => [
+          ...prev,
+          {
+            id: protocolId,
+            encryptedDemand: encrypted.demand,
+            encryptedMaxRate: encrypted.maxRate,
+            iv,
+            clientPublicKey,
+          },
+        ]);
+      } else {
+        const res = await fetch("/api/offer/protocol", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            id: protocolId,
+            encryptedDemand: encrypted.demand,
+            encryptedMaxRate: encrypted.maxRate,
+            iv,
+            clientPublicKey,
+          }),
+        });
+        if (!res.ok) throw new Error(JSON.stringify(await res.json()));
       }
+
       setProtocolStatus("success");
     } catch (err) {
       setProtocolStatus("error");
@@ -367,12 +591,21 @@ export default function Home() {
     setSettleStatus("loading");
     setSettleError("");
     try {
-      const res = await fetch("/api/settle", { method: "POST" });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error ?? JSON.stringify(err));
+      if (MOCK_MODE) {
+        const kp = mockMxeKeyRef.current;
+        if (!kp) throw new Error("Mock MXE key not ready yet");
+        if (storedLpOffers.length === 0 && storedProtocolOffers.length === 0)
+          throw new Error("No offers submitted yet — add LP and Protocol offers first");
+        const result = await runMockAuction(storedLpOffers, storedProtocolOffers, kp.privateKey);
+        setSettlementResult({ settlementId: crypto.randomUUID(), ...result });
+      } else {
+        const res = await fetch("/api/settle", { method: "POST" });
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error ?? JSON.stringify(err));
+        }
+        setSettlementResult(await res.json());
       }
-      setSettlementResult(await res.json());
       setSettleStatus("success");
     } catch (err) {
       setSettleStatus("error");
@@ -388,12 +621,23 @@ export default function Home() {
     setCheckError("");
     setCheckResult(null);
     try {
-      const res = await fetch(`/api/result/${encodeURIComponent(checkId.trim())}`);
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error ?? JSON.stringify(err));
+      if (MOCK_MODE) {
+        if (!settlementResult)
+          throw new Error("No settlement has been run yet — trigger settlement first");
+        const id = checkId.trim();
+        const matches = settlementResult.matches.filter(
+          (m) => m.lpId === id || m.protocolId === id
+        );
+        if (matches.length === 0) throw new Error("No results found for this participant ID");
+        setCheckResult({ participantId: id, matches });
+      } else {
+        const res = await fetch(`/api/result/${encodeURIComponent(checkId.trim())}`);
+        if (!res.ok) {
+          const err = await res.json();
+          throw new Error(err.error ?? JSON.stringify(err));
+        }
+        setCheckResult(await res.json());
       }
-      setCheckResult(await res.json());
       setCheckStatus("success");
     } catch (err) {
       setCheckStatus("error");
@@ -413,7 +657,7 @@ export default function Home() {
     >
       {/* ── Banner ── */}
       <div
-        className="w-full text-center py-2 px-4 text-[11px] font-mono tracking-[0.15em]"
+        className="w-full text-center py-2 px-4 text-[11px] font-mono tracking-[0.12em]"
         style={{
           background:
             "linear-gradient(90deg, rgba(6,182,212,0.07) 0%, rgba(168,85,247,0.07) 100%)",
@@ -421,7 +665,7 @@ export default function Home() {
           color: "#67e8f9",
         }}
       >
-        ⚡ MXE Simulated — Arcium encrypted compute environment
+        ⚡ Demo Mode — Full X25519 + AES-GCM-256 encryption, MXE computation simulated in browser
       </div>
 
       <main className="mx-auto max-w-lg px-4 py-14">
@@ -441,8 +685,7 @@ export default function Home() {
           <h1
             className="text-4xl sm:text-5xl font-bold tracking-tight mb-3 leading-tight"
             style={{
-              background:
-                "linear-gradient(135deg, #ffffff 0%, #22d3ee 45%, #a855f7 100%)",
+              background: "linear-gradient(135deg, #ffffff 0%, #22d3ee 45%, #a855f7 100%)",
               WebkitBackgroundClip: "text",
               WebkitTextFillColor: "transparent",
             }}
@@ -451,7 +694,7 @@ export default function Home() {
           </h1>
 
           <p className="text-slate-500 text-sm leading-relaxed">
-            Capital allocated via encrypted bidding · Matching runs inside the MXE
+            Capital allocated via encrypted bidding · Matching computed inside the MXE
           </p>
         </div>
 
@@ -489,19 +732,15 @@ export default function Home() {
           })}
         </div>
 
-        {/* ════════════════════════════════════════════════
+        {/* ════════════════════════════════════════════
             LP MODE
-        ════════════════════════════════════════════════ */}
+        ════════════════════════════════════════════ */}
         {mode === "lp" && (
           <div style={card}>
-            {/* Card header */}
             <div className="flex items-center gap-3 mb-7">
               <div
                 className="w-10 h-10 rounded-xl flex items-center justify-center text-xl shrink-0"
-                style={{
-                  background: "rgba(6,182,212,0.12)",
-                  border: "1px solid rgba(6,182,212,0.28)",
-                }}
+                style={{ background: "rgba(6,182,212,0.12)", border: "1px solid rgba(6,182,212,0.28)" }}
               >
                 💰
               </div>
@@ -543,9 +782,7 @@ export default function Home() {
                   type="submit"
                   disabled={lpStatus === "loading"}
                   className="btn-glow-cyan mt-1 w-full rounded-xl py-3.5 text-sm font-semibold text-white transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
-                  style={{
-                    background: "linear-gradient(135deg, #0891b2 0%, #6d28d9 100%)",
-                  }}
+                  style={{ background: "linear-gradient(135deg, #0891b2 0%, #6d28d9 100%)" }}
                 >
                   {lpStatus === "loading" ? (
                     <span className="flex items-center justify-center gap-2">
@@ -572,9 +809,9 @@ export default function Home() {
           </div>
         )}
 
-        {/* ════════════════════════════════════════════════
+        {/* ════════════════════════════════════════════
             PROTOCOL MODE
-        ════════════════════════════════════════════════ */}
+        ════════════════════════════════════════════ */}
         {mode === "protocol" && (
           <div style={card}>
             <div className="flex items-center gap-3 mb-7">
@@ -655,14 +892,14 @@ export default function Home() {
           </div>
         )}
 
-        {/* ════════════════════════════════════════════════
+        {/* ════════════════════════════════════════════
             AUCTIONEER MODE
-        ════════════════════════════════════════════════ */}
+        ════════════════════════════════════════════ */}
         {mode === "auctioneer" && (
           <div className="flex flex-col gap-4">
             {/* Trigger settlement */}
             <div style={card}>
-              <div className="flex items-center gap-3 mb-7">
+              <div className="flex items-center gap-3 mb-6">
                 <div
                   className="w-10 h-10 rounded-xl flex items-center justify-center text-xl shrink-0"
                   style={{
@@ -675,10 +912,28 @@ export default function Home() {
                 <div>
                   <h2 className="text-base font-semibold text-white">Trigger Settlement</h2>
                   <p className="text-xs text-slate-600">
-                    Runs the sealed double auction inside the MXE
+                    {MOCK_MODE
+                      ? "Decrypts all offers and runs the auction in-browser"
+                      : "Runs the sealed double auction inside the MXE"}
                   </p>
                 </div>
               </div>
+
+              {/* Mock-mode offer queue indicator */}
+              {MOCK_MODE && (
+                <div className="grid grid-cols-2 gap-2 mb-5">
+                  <StatBox
+                    label="LP Offers Queued"
+                    value={String(storedLpOffers.length)}
+                    accent="cyan"
+                  />
+                  <StatBox
+                    label="Protocol Offers Queued"
+                    value={String(storedProtocolOffers.length)}
+                    accent="purple"
+                  />
+                </div>
+              )}
 
               <button
                 onClick={handleSettle}
@@ -739,7 +994,6 @@ export default function Home() {
                       />
                     </div>
 
-                    {/* Algorithm hash */}
                     <div
                       className="rounded-xl px-4 py-3 flex items-start gap-2.5"
                       style={{
@@ -852,12 +1106,8 @@ export default function Home() {
 
                           <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
                             <div>
-                              <p className="text-slate-600 mb-0.5 text-[10px] uppercase tracking-widest">
-                                LP
-                              </p>
-                              <p className="font-mono text-slate-400 truncate">
-                                {m.lpId.slice(0, 18)}…
-                              </p>
+                              <p className="text-slate-600 mb-0.5 text-[10px] uppercase tracking-widest">LP</p>
+                              <p className="font-mono text-slate-400 truncate">{m.lpId.slice(0, 18)}…</p>
                             </div>
                             <div>
                               <p className="text-slate-600 mb-0.5 text-[10px] uppercase tracking-widest">
@@ -879,7 +1129,9 @@ export default function Home() {
                               <p className="text-slate-600 mb-0.5 text-[10px] uppercase tracking-widest">
                                 Clearing Rate
                               </p>
-                              <p className="font-semibold text-cyan-400">{m.clearingRate.toFixed(4)}%</p>
+                              <p className="font-semibold text-cyan-400">
+                                {m.clearingRate.toFixed(4)}%
+                              </p>
                             </div>
                           </div>
                         </div>
